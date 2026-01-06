@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import re
+import os
+import argparse
+import shutil
+import concurrent.futures
+from datetime import datetime
+
+# --- Configuration & Colors ---
+MAX_CONCURRENT_HOSTS = 3  # Low number to keep VPN stable
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+RESET = "\033[0m"
+
+# --- Root Check ---
+if os.geteuid() != 0:
+    print(f"{RED}[!] This script must be run as root.{RESET}")
+    sys.exit(1)
+
+# Handle Sudo User Ownership
+try:
+    SUDO_UID = int(os.environ.get("SUDO_UID"))
+    SUDO_GID = int(os.environ.get("SUDO_GID"))
+except (TypeError, ValueError):
+    # Fallback if run as actual root login
+    SUDO_UID = os.getuid()
+    SUDO_GID = os.getgid()
+
+def log(msg, type="INFO"):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    if type == "INFO":
+        print(f"[{BLUE}*{RESET}] {msg}")
+    elif type == "SUCCESS":
+        print(f"[{GREEN}+{RESET}] {msg}")
+    elif type == "WARN":
+        print(f"[{YELLOW}!{RESET}] {msg}")
+    elif type == "ERROR":
+        print(f"[{RED}-{RESET}] {msg}")
+
+def run_command(cmd, shell=False):
+    """Wrapper to run shell commands."""
+    try:
+        # If cmd is a list, we don't use shell=True usually, but for piping we might need it.
+        # Here we stick to list format for safety unless specified.
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=shell
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        log(f"Command failed: {e}", "ERROR")
+        return ""
+
+def fix_permissions(directory):
+    """Recursively change ownership of the output directory to the sudo user."""
+    for root, dirs, files in os.walk(directory):
+        for d in dirs:
+            os.chown(os.path.join(root, d), SUDO_UID, SUDO_GID)
+        for f in files:
+            os.chown(os.path.join(root, f), SUDO_UID, SUDO_GID)
+    os.chown(directory, SUDO_UID, SUDO_GID)
+
+def perform_host_discovery(target, args):
+    """Identifies live hosts using Nmap or raw logic."""
+    log(f"Discovering live hosts in {target}...", "INFO")
+
+    # If proxying, we cannot use ICMP/ARP. We assume TCP Connect scan or skip discovery if single IP.
+    if args.proxy:
+        flags = ["nmap", "-Pn", "-n", "-sT", "-sn", target]
+    else:
+        # Standard discovery: ICMP echo, Timestamp, and TCP SYN to 443/80
+        flags = ["nmap", "-sn", "-PE", "-PP", "-PS443,80", "-n", target]
+
+    output = run_command(flags)
+
+    # Extract IPs
+    live_hosts = re.findall(r"Nmap scan report for ([\d\.]+)", output)
+
+    # Filter out your own interface IP if it shows up (optional refinement)
+    return list(set(live_hosts))
+
+def scan_host_workflow(ip, args):
+    """The full scanning logic for a single host."""
+
+    # 1. Create Directory
+    work_dir = os.path.abspath(ip)
+    if not os.path.exists(work_dir):
+        os.makedirs(work_dir)
+
+    log(f"Starting workflow for {ip}", "INFO")
+
+    # --- Step 1: Fast TCP Scan (All Ports) ---
+    # We scan ALL ports fast to find what is open.
+    # --min-rate 1000 is aggressive but standard for CTFs. Lower if VPN is trash.
+    tcp_all_file = os.path.join(work_dir, "tcp_all_ports")
+
+    scan_type = "-sT" if args.proxy else "-sS"
+
+    log(f"[{ip}] fast scan started (0-65535)", "INFO")
+    cmd_fast = [
+        "nmap", "-Pn", "-n", scan_type, "-p-", "--open",
+        "--min-rate", "1000", "-vv",
+        "-oN", f"{tcp_all_file}.nmap",
+        ip
+    ]
+    run_command(cmd_fast)
+
+    # Extract Open Ports
+    try:
+        with open(f"{tcp_all_file}.nmap", "r") as f:
+            content = f.read()
+            open_ports = re.findall(r"(\d+)/tcp\s+open", content)
+    except FileNotFoundError:
+        log(f"[{ip}] Failed to read fast scan output.", "ERROR")
+        return
+
+    if not open_ports:
+        log(f"[{ip}] No open ports found. Skipping deep scan.", "WARN")
+        fix_permissions(work_dir)
+        return
+
+    ports_str = ",".join(open_ports)
+    log(f"[{ip}] Found {len(open_ports)} open ports: {ports_str}", "SUCCESS")
+
+    # --- Step 2: Deep Scan (Scripts + Version) on OPEN PORTS ONLY ---
+    # This is the "money" scan.
+    tcp_detail_file = os.path.join(work_dir, "tcp_detailed")
+    log(f"[{ip}] detailed scan started on known ports", "INFO")
+
+    cmd_detail = [
+        "nmap", "-Pn", "-n", scan_type, "-sC", "-sV", "-O",
+        "-p", ports_str,
+        "-oN", f"{tcp_detail_file}.nmap",
+        ip
+    ]
+    run_command(cmd_detail)
+    log(f"[{ip}] detailed scan finished.", "SUCCESS")
+
+    # --- Step 3: Targeted UDP Scan (Optional) ---
+    # Only scans top 20 ports. Full UDP takes too long.
+    if args.udp:
+        udp_file = os.path.join(work_dir, "udp_top20")
+        log(f"[{ip}] UDP top-20 scan started", "INFO")
+        cmd_udp = [
+            "nmap", "-Pn", "-n", "-sU", "--top-ports", "20",
+            "-oN", f"{udp_file}.nmap",
+            ip
+        ]
+        run_command(cmd_udp)
+
+    # Cleanup permissions
+    fix_permissions(work_dir)
+    log(f"[{ip}] All scans completed. Results in /{ip}/", "SUCCESS")
+
+def main():
+    parser = argparse.ArgumentParser(description="OSCP Automated Scanner (Staged)")
+    parser.add_argument("target", help="IP, CIDR, or hostname")
+    parser.add_argument("--proxy", action="store_true", help="Use Connect Scan (-sT) for Proxychains compatibility")
+    parser.add_argument("--udp", action="store_true", help="Include a top-20 UDP scan")
+    parser.add_argument("--concurrency", type=int, default=MAX_CONCURRENT_HOSTS, help="Max hosts to scan at once")
+    args = parser.parse_args()
+
+    # Banner
+    print(f"{YELLOW}--- OSCP AutoScanner ---\nTarget: {args.target}\nProxy Mode: {args.proxy}\nSudo User: {SUDO_UID}{RESET}\n")
+
+    # 1. Discovery
+    hosts = perform_host_discovery(args.target, args)
+
+    if not hosts:
+        log("No live hosts found. If using Proxychains, specify the single IP directly or check connection.", "ERROR")
+        sys.exit(1)
+
+    log(f"Found {len(hosts)} live hosts: {', '.join(hosts)}", "SUCCESS")
+
+    # 2. Scanning Loop (Threaded)
+    # We use a ThreadPool to scan multiple IPs at once, but limited to --concurrency
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+        futures = {executor.submit(scan_host_workflow, ip, args): ip for ip in hosts}
+
+        for future in concurrent.futures.as_completed(futures):
+            ip = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                log(f"{ip} generated an exception: {exc}", "ERROR")
+
+    print(f"\n{GREEN}[+] Engagement Completed.{RESET}")
+
+if __name__ == "__main__":
+    main()
