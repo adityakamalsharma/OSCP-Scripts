@@ -1,0 +1,206 @@
+import sys
+import os
+import subprocess
+import argparse
+import requests
+import shutil
+from urllib.parse import urlparse
+
+# --- HARDCODED DEFAULTS (OSCP OPTIMIZED) ---
+# Update these paths if your Kali setup differs
+PATH_COMMON = "/usr/share/wordlists/dirb/common.txt"
+PATH_MEDIUM = "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"
+# Fallback path for SecLists if standard dirbuster path is missing
+PATH_MEDIUM_SECLISTS = "/usr/share/wordlists/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt"
+PATH_LARGE = "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt" # Using 'small' as 3rd tier to save time, swap for 'big' if bold.
+PATH_SUBDOMAINS = "/usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-5000.txt"
+
+# Tools
+TOOL_FFUF = "ffuf"
+TOOL_FEROX = "feroxbuster"
+
+class Colors:
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BLUE = '\033[94m'
+    RESET = '\033[0m'
+
+def print_log(msg, level="INFO"):
+    if level == "INFO": prefix = f"{Colors.BLUE}[*]{Colors.RESET}"
+    elif level == "SUCCESS": prefix = f"{Colors.GREEN}[+]{Colors.RESET}"
+    elif level == "WARN": prefix = f"{Colors.YELLOW}[!]{Colors.RESET}"
+    elif level == "ERROR": prefix = f"{Colors.RED}[-]{Colors.RESET}"
+    print(f"{prefix} {msg}")
+
+def check_tools():
+    """Ensure required tools are installed."""
+    if not shutil.which(TOOL_FFUF):
+        print_log(f"{TOOL_FFUF} not found. Install with: sudo apt install ffuf", "ERROR")
+        sys.exit(1)
+    if not shutil.which(TOOL_FEROX):
+        print_log(f"{TOOL_FEROX} not found. Install with: sudo apt install feroxbuster", "ERROR")
+        sys.exit(1)
+
+def get_valid_wordlist(user_path, default_path, fallback_path=None):
+    """Smart selection of wordlists."""
+    if user_path:
+        if os.path.exists(user_path): return user_path
+        print_log(f"Custom wordlist not found: {user_path}. Falling back...", "WARN")
+    
+    if os.path.exists(default_path): return default_path
+    if fallback_path and os.path.exists(fallback_path): return fallback_path
+    
+    return None
+
+def detect_language(url):
+    """Simple heuristic to detect tech stack for extensions."""
+    print_log("Identifying technology stack...", "INFO")
+    extensions = ["php", "aspx", "html", "jsp", "txt"]
+    detected = []
+    
+    # 1. Check index files
+    checks = {
+        "index.php": "php",
+        "index.asp": "asp",
+        "Default.aspx": "aspx",
+        "index.jsp": "jsp"
+    }
+    
+    try:
+        for page, ext in checks.items():
+            r = requests.head(f"{url}/{page}", timeout=3, allow_redirects=False)
+            if r.status_code == 200:
+                print_log(f"Detected {ext.upper()} via {page}", "SUCCESS")
+                detected.append(ext)
+                break # Found the main one
+    except:
+        pass
+
+    if not detected:
+        print_log("Could not auto-detect language. Using default set.", "WARN")
+        return "php,txt,html,aspx,jsp" # Default shotgun approach
+    
+    # Always add txt and generic extensions
+    detected.append("txt")
+    detected.append("xml")
+    return ",".join(detected)
+
+def run_vhost_scan(url, wordlist):
+    """Runs ffuf for VHost discovery."""
+    domain = urlparse(url).netloc.split(':')[0]
+    print_log(f"Starting VHost Scan on {domain}...", "INFO")
+    
+    if not wordlist or not os.path.exists(wordlist):
+        print_log("VHost wordlist missing. Skipping VHost scan.", "WARN")
+        return
+
+    # -ac: Auto-calibrate (crucial for soft 404s on vhosts)
+    # -c: Color output
+    # -u: Target URL
+    # -H: Host Header Fuzzing
+    cmd = [
+        TOOL_FFUF,
+        "-w", wordlist,
+        "-u", url,
+        "-H", f"Host: FUZZ.{domain}",
+        "-ac", 
+        "-c",
+        "-o", "vhost_results.json"
+    ]
+    
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        print_log("VHost scan skipped by user.", "WARN")
+
+def run_dir_scan(url, wordlists, extensions, depth, threads):
+    """Chains feroxbuster scans."""
+    print_log(f"Starting Directory Fuzzing (Depth: {depth}, Ext: {extensions})", "INFO")
+    
+    # Feroxbuster is recursive, so we run the lists sequentially.
+    # We use --smart to handle soft 404s automatically.
+    
+    for i, wlist in enumerate(wordlists):
+        if not wlist or not os.path.exists(wlist):
+            print_log(f"Skipping invalid wordlist: {wlist}", "WARN")
+            continue
+            
+        print_log(f"Running Phase {i+1}/{len(wordlists)}: {os.path.basename(wlist)}", "INFO")
+        
+        output_file = f"dir_scan_phase{i+1}.txt"
+        
+        cmd = [
+            TOOL_FEROX,
+            "-u", url,
+            "-w", wlist,
+            "-x", extensions,
+            "-d", str(depth),
+            "-t", str(threads),
+            "--smart",         # Auto-tune for soft 404s
+            "--auto-bail",     # Stop if too many errors (WAF/Crash)
+            "-o", output_file,
+            "--no-state"       # Don't save state files, keep it clean
+        ]
+        
+        try:
+            subprocess.run(cmd, check=False)
+        except KeyboardInterrupt:
+            choice = input(f"\n{Colors.YELLOW}[?] You interrupted Phase {i+1}. Skip to next list? (y/n/quit): {Colors.RESET}")
+            if choice.lower() == 'quit': sys.exit(0)
+            if choice.lower() == 'n': sys.exit(0)
+            continue # Skip to next list
+
+def main():
+    parser = argparse.ArgumentParser(description="OSCP Wrapper for ffuf & feroxbuster")
+    parser.add_argument("url", help="Target URL (http://IP:PORT)")
+    parser.add_argument("--manual", action="store_true", help="Interactive mode to pick wordlists")
+    parser.add_argument("-d", "--depth", default=2, type=int, help="Recursion depth (Default: 2)")
+    parser.add_argument("-t", "--threads", default=50, type=int, help="Threads (Default: 50)")
+    args = parser.parse_args()
+
+    check_tools()
+    
+    # 1. Wordlist Configuration
+    w_vhost = PATH_SUBDOMAINS
+    w_phase1 = PATH_COMMON
+    w_phase2 = get_valid_wordlist(None, PATH_MEDIUM, PATH_MEDIUM_SECLISTS)
+    w_phase3 = PATH_LARGE
+
+    if args.manual:
+        print(f"\n{Colors.GREEN}--- Manual Configuration ---{Colors.RESET}")
+        print(f"Current VHost List: {w_vhost}")
+        if input("Change? (y/N): ").lower() == 'y': w_vhost = input("Path: ").strip()
+        
+        print(f"Current Phase 1 (Common): {w_phase1}")
+        if input("Change? (y/N): ").lower() == 'y': w_phase1 = input("Path: ").strip()
+        
+        print(f"Current Phase 2 (Medium): {w_phase2}")
+        if input("Change? (y/N): ").lower() == 'y': w_phase2 = input("Path: ").strip()
+        
+        print(f"Current Phase 3 (Large): {w_phase3}")
+        if input("Change? (y/N): ").lower() == 'y': w_phase3 = input("Path: ").strip()
+        print("-" * 30 + "\n")
+
+    # 2. Language Detection
+    exts = detect_language(args.url)
+    
+    # 3. VHost Scan (ffuf)
+    # Only run if user didn't empty the wordlist path in manual mode
+    if w_vhost and w_vhost != "skip":
+        run_vhost_scan(args.url, w_vhost)
+    
+    # 4. Directory Scan (feroxbuster)
+    # We chain them in the list. Feroxbuster will run them one by one.
+    active_wordlists = [w for w in [w_phase1, w_phase2, w_phase3] if w is not None]
+    
+    if active_wordlists:
+        run_dir_scan(args.url, active_wordlists, exts, args.depth, args.threads)
+    else:
+        print_log("No valid wordlists found for directory scan!", "ERROR")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Exiting...")
