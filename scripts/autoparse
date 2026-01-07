@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+import os
+import argparse
+import xml.etree.ElementTree as ET
+from glob import glob
+
+# --------------------------------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------------------------------
+# This script targets Nmap XML output specifically from Autorecon.
+# It prioritizes 'Open' ports and merges data from multiple scan files.
+# --------------------------------------------------------------------------
+
+def parse_nmap_xml(file_path):
+    """
+    Parses a single Nmap XML file.
+    Returns a dict with 'tcp' and 'udp' keys containing port details.
+    """
+    try:
+        tree = ET.parse(file_path)
+    except ET.ParseError:
+        # Autorecon sometimes leaves empty XMLs if a scan was cancelled or yielded no results.
+        # We skip these silently to prevent crashes.
+        return {'tcp': {}, 'udp': {}}
+    except Exception as e:
+        print(f"[-] Error reading {file_path}: {e}")
+        return {'tcp': {}, 'udp': {}}
+
+    root = tree.getroot()
+    extracted_data = {'tcp': {}, 'udp': {}}
+
+    # Iterate through all hosts found in the XML (usually just one)
+    for host in root.findall('host'):
+        ports = host.find('ports')
+        if ports is None:
+            continue
+
+        for port in ports.findall('port'):
+            # FILTER: We only care about OPEN ports. 
+            state = port.find('state')
+            if state is None or state.get('state') != 'open':
+                continue
+
+            port_id = int(port.get('portid'))
+            protocol = port.get('protocol') # 'tcp' or 'udp'
+            
+            # Service Details
+            service = port.find('service')
+            service_name = service.get('name') if service is not None else "unknown"
+            product = service.get('product') if service is not None else ""
+            version = service.get('version') if service is not None else ""
+            
+            # Combine Product + Version (e.g., "Apache" + "2.4.49")
+            full_version = f"{product} {version}".strip()
+            
+            # NSE Script Output (e.g., 'ftp-anon', 'http-title')
+            script_outputs = []
+            for script in port.findall('script'):
+                sid = script.get('id')
+                output = script.get('output')
+                if sid and output:
+                    # formatting as Bold ID + Output
+                    script_outputs.append(f"**{sid}**:\n{output.strip()}")
+
+            entry = {
+                'port': port_id,
+                'service': service_name,
+                'version': full_version,
+                'scripts': script_outputs
+            }
+
+            # Initialize protocol dict if not present (safety check)
+            if protocol not in extracted_data:
+                extracted_data[protocol] = {}
+            
+            extracted_data[protocol][port_id] = entry
+
+    return extracted_data
+
+def merge_results(scan_dir):
+    """
+    Recursively finds all .xml files and merges them into a Master Dictionary.
+    Logic: If a port exists in multiple files, keep the one with the longest Version string.
+    """
+    # Recursive glob to find .xml in all subdirectories
+    xml_files = [y for x in os.walk(scan_dir) for y in glob(os.path.join(x[0], '*.xml'))]
+    
+    if not xml_files:
+        print(f"[-] No .xml files found in {scan_dir}. Check your path.")
+        return None
+
+    master_tcp = {}
+    master_udp = {}
+
+    print(f"[*] Found {len(xml_files)} XML files. Parsing and merging...")
+
+    for xml_file in xml_files:
+        data = parse_nmap_xml(xml_file)
+        
+        # --- MERGE TCP ---
+        for port, info in data.get('tcp', {}).items():
+            if port not in master_tcp:
+                master_tcp[port] = info
+            else:
+                # Heuristic: If new data has a longer version string, it's likely more accurate/detailed.
+                if len(info['version']) > len(master_tcp[port]['version']):
+                    master_tcp[port]['version'] = info['version']
+                    master_tcp[port]['service'] = info['service']
+            
+            # Always merge unique script outputs (don't lose data)
+            existing_scripts = set(master_tcp[port].get('scripts', []))
+            new_scripts = set(info['scripts'])
+            master_tcp[port]['scripts'] = list(existing_scripts.union(new_scripts))
+
+        # --- MERGE UDP ---
+        for port, info in data.get('udp', {}).items():
+            if port not in master_udp:
+                master_udp[port] = info
+            elif len(info['version']) > len(master_udp[port]['version']):
+                master_udp[port]['version'] = info['version']
+    
+    return master_tcp, master_udp
+
+def generate_markdown(tcp_data, udp_data, show_scripts=False):
+    """
+    Converts the Master Dictionary into a Markdown string.
+    """
+    output = []
+    
+    def build_table(data_dict, title):
+        if not data_dict:
+            return
+        
+        sorted_ports = sorted(data_dict.keys())
+        output.append(f"### {title} Ports")
+        output.append("| Port | Service | Version |")
+        output.append("|:---|:---|:---|")
+        
+        for p in sorted_ports:
+            item = data_dict[p]
+            # Escape pipes '|' so they don't break the Markdown table structure
+            clean_ver = item['version'].replace('|', '\\|') 
+            output.append(f"| {p} | {item['service']} | {clean_ver} |")
+        output.append("\n")
+
+    build_table(tcp_data, "TCP")
+    build_table(udp_data, "UDP")
+
+    # Optional: Script Details Section
+    if show_scripts:
+        has_scripts = False
+        script_section = ["### Script Details (NSE)\n"]
+        
+        # Only showing scripts for TCP to reduce noise, unless you want UDP too?
+        # (Standard OSCP workflow focuses on TCP scripts mostly)
+        for p in sorted(tcp_data.keys()):
+            scripts = tcp_data[p]['scripts']
+            if scripts:
+                has_scripts = True
+                script_section.append(f"#### Port {p} ({tcp_data[p]['service']})")
+                for s in scripts:
+                    script_section.append("```text")
+                    script_section.append(s)
+                    script_section.append("```\n")
+        
+        if has_scripts:
+            output.extend(script_section)
+
+    return "\n".join(output)
+
+def main():
+    parser = argparse.ArgumentParser(description="Parse Autorecon/Nmap XMLs into Obsidian-ready tables.")
+    parser.add_argument("target_dir", help="Path to the directory containing scan results")
+    parser.add_argument("-s", "--scripts", action="store_true", help="Include NSE script output in a separate section")
+    
+    args = parser.parse_args()
+
+    results = merge_results(args.target_dir)
+    if not results:
+        return
+
+    tcp, udp = results
+    
+    if not tcp and not udp:
+        print("[-] No open ports found in the parsed XML files.")
+        return
+
+    md_output = generate_markdown(tcp, udp, args.scripts)
+
+    # 1. Output to Terminal
+    print("\n" + "="*40)
+    print(md_output)
+    print("="*40 + "\n")
+
+    # 2. Output to File
+    # Name the file based on the target folder name (usually the IP)
+    target_name = os.path.basename(os.path.normpath(args.target_dir))
+    outfile = f"{target_name}_summary.md"
+    
+    with open(outfile, "w") as f:
+        f.write(md_output)
+    
+    print(f"[+] Successfully saved to {outfile}")
+
+if __name__ == "__main__":
+    main()
