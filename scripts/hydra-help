@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import argparse
+import textwrap
+
+# --- Configuration & Defaults ---
+# Tier 1 "Sanity Check" Defaults (Total ~250 requests)
+DEFAULT_USER_LIST = "/usr/share/seclists/Usernames/top-usernames-shortlist.txt"
+DEFAULT_PASS_LIST = "/usr/share/seclists/Passwords/Common-Credentials/best15.txt"
+
+# Tier 2 "Thorough" Defaults (For reference/overrides)
+TIER2_PASS_LIST = "/usr/share/seclists/Passwords/Common-Credentials/best1050.txt"
+
+# Standard Services & Ports
+SERVICES = {
+    "1": {"name": "ssh", "port": "22"},
+    "2": {"name": "ftp", "port": "21"},
+    "3": {"name": "rdp", "port": "3389"},
+    "4": {"name": "smb", "port": "445"},
+    "5": {"name": "http-post-form", "port": "80"},
+    "6": {"name": "mysql", "port": "3306"},
+    "7": {"name": "mssql", "port": "1433"},
+    "8": {"name": "telnet", "port": "23"},
+}
+
+def print_banner():
+    print(r"""
+    =============================================
+       H Y D R A   W I Z A R D   (Fast Mode)
+    =============================================
+    """)
+
+def get_input(prompt, default=None):
+    if default:
+        user_input = input(f"[?] {prompt} [{default}]: ").strip()
+        return user_input if user_input else default
+    else:
+        return input(f"[?] {prompt}: ").strip()
+
+def count_lines(filepath):
+    """Returns the line count of a file for estimation."""
+    try:
+        with open(filepath, 'r', encoding='latin-1') as f:
+            return sum(1 for _ in f)
+    except:
+        return 0
+
+def select_service():
+    print("\n--- Service Selection ---")
+    for key, val in SERVICES.items():
+        print(f" {key}. {val['name'].upper()} (Default Port: {val['port']})")
+    
+    choice = get_input("Select service number", "1")
+    if choice not in SERVICES:
+        print("[!] Invalid selection. Defaulting to SSH.")
+        return SERVICES["1"]
+    return SERVICES[choice]
+
+def configure_wordlists():
+    print("\n--- Wordlist Configuration ---")
+    print(f"Default Strategy: 'Dumb Check' (Using best15.txt)")
+    
+    # Username Logic
+    user_count = 1
+    user_choice = get_input("Target Single User (S) or User List (L)?", "L").upper()
+    if user_choice == "S":
+        login_arg = "-l " + get_input("Enter Username", "admin")
+        user_count = 1
+    else:
+        path = get_input("Enter path to User List", DEFAULT_USER_LIST)
+        if not os.path.exists(path):
+            print(f"[!] Warning: File {path} not found.")
+        login_arg = "-L " + path
+        user_count = count_lines(path)
+
+    # Password Logic
+    pass_count = 1
+    pass_choice = get_input("Target Single Password (S) or Pass List (L)?", "L").upper()
+    if pass_choice == "S":
+        pass_arg = "-p " + get_input("Enter Password", "password")
+        pass_count = 1
+    else:
+        # Suggest best15 by default, but mention best1050
+        print(f"Tip: Press Enter for 'best15.txt' (Fast). Type '{TIER2_PASS_LIST}' for heavier attack.")
+        path = get_input("Enter path to Pass List", DEFAULT_PASS_LIST)
+        if not os.path.exists(path):
+            print(f"[!] Warning: File {path} not found.")
+        pass_arg = "-P " + path
+        pass_count = count_lines(path)
+
+    # Estimate Total Requests
+    total_reqs = user_count * pass_count
+    print(f"\n[i] Estimated Attempts: {user_count} users x {pass_count} passwords = {total_reqs} requests")
+    
+    return login_arg, pass_arg
+
+def configure_http_form():
+    print("\n--- HTTP-POST-FORM Configuration ---")
+    print("Instruction: Paste raw Body from Burp. Replace user/pass with ^USER^ and ^PASS^.")
+    
+    url = get_input("Login Page URL (e.g., /login.php)")
+    body = get_input("Body (e.g., user=^USER^&pass=^PASS^)")
+    fail_msg = get_input("Failure String (e.g., Invalid password)")
+    
+    return f'"{url}:{body}:{fail_msg}"'
+
+def main():
+    parser = argparse.ArgumentParser(description="Hydra Wizard for OSCP")
+    parser.add_argument("--help-manual", action="store_true", help="Show detailed manual")
+    args, unknown = parser.parse_known_args()
+
+    if args.help_manual:
+        print("Use interactively to generate Hydra commands.")
+        sys.exit(0)
+
+    print_banner()
+
+    # 1. Target
+    target_ip = get_input("Target IP Address")
+    if not target_ip:
+        sys.exit(1)
+
+    # 2. Service
+    service_data = select_service()
+    service_name = service_data['name']
+    
+    # 3. Port
+    port = get_input(f"Port", service_data['port'])
+
+    # 4. Wordlists
+    login_arg, pass_arg = configure_wordlists()
+
+    # 5. Options
+    stop_on_success = get_input("Stop on first success (-f)? [Y/n]", "Y").upper()
+    flag_f = "-f" if stop_on_success == "Y" else ""
+    
+    # 6. Construct Command
+    cmd_list = ["hydra", "-t", "4"] 
+    
+    if flag_f:
+        cmd_list.append(flag_f)
+    
+    cmd_list.append("-V") # Verbose
+    cmd_list.extend(login_arg.split(" ", 1))
+    cmd_list.extend(pass_arg.split(" ", 1))
+    
+    outfile = f"{target_ip}_{service_name}_creds.txt"
+    cmd_list.extend(["-o", outfile])
+    cmd_list.extend(["-s", port])
+    cmd_list.append(target_ip)
+    cmd_list.append(service_name)
+    
+    if service_name == "http-post-form":
+        module_string = configure_http_form()
+        cmd_list.append(module_string.strip('"'))
+
+    # 7. Review
+    print("\n" + "="*40)
+    print("FINAL COMMAND:")
+    print(" ".join(cmd_list))
+    print("="*40)
+    
+    run_now = get_input("Run this command now? [Y/n]", "Y").upper()
+    
+    if run_now == "Y":
+        try:
+            subprocess.run(cmd_list)
+        except KeyboardInterrupt:
+            print("\n[!] Interrupted.")
+        except FileNotFoundError:
+            print("\n[!] Error: 'hydra' not found.")
+
+if __name__ == "__main__":
+    main()
