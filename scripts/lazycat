@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import shutil
+
+# --- CONFIGURATION ---
+DEFAULT_WORDLIST = "/usr/share/wordlists/rockyou.txt"
+HASHCAT_RULES_DIR = "/usr/share/hashcat/rules/"
+
+# Common Modes for quick lookup (OSCP/CTF staples)
+COMMON_MODES = {
+    "0": "MD5",
+    "100": "SHA1",
+    "1000": "NTLM",
+    "5600": "NetNTLMv2",
+    "1800": "sha512crypt $6$, SHA512 (Unix)",
+    "3200": "bcrypt $2*$, Blowfish (Unix)",
+    "13100": "Kerberos 5, etype 23, TGS-REP",
+    "18200": "Kerberos 5, etype 23, AS-REP",
+    "1600": "Apache $apr1$ MD5, md5apr1, MD5 (APR)",
+    "400": "phpass",
+    "1700": "SHA-512 (macOS)",
+    "22000": "WPA-PBKDF2-PMKID+EAPOL (WiFi)",
+    "16100": "TACACS+",
+    "11300": "Bitcoin/Litecoin wallet.dat",
+}
+
+# --- COLORS ---
+G = '\033[92m'  # Green
+Y = '\033[93m'  # Yellow
+R = '\033[91m'  # Red
+B = '\033[94m'  # Blue
+END = '\033[0m'
+
+def print_header():
+    print(f"{B}========================================{END}")
+    print(f"{B}   LazyCat - Hashcat Wrapper Wizard    {END}")
+    print(f"{B}========================================{END}")
+
+def check_dependency(tool):
+    return shutil.which(tool) is not None
+
+def run_fzf_selection(options_list, prompt="Select an option:"):
+    """
+    Pipes a list of strings into fzf and returns the selected string.
+    """
+    if not check_dependency("fzf"):
+        # Fallback if fzf is missing
+        print(f"{R}[!] fzf not found. Using simple list.{END}")
+        for i, opt in enumerate(options_list):
+            print(f"{i+1}) {opt}")
+        try:
+            choice = int(input(f"{Y}{prompt} (Number): {END}")) - 1
+            if 0 <= choice < len(options_list):
+                return options_list[choice]
+        except ValueError:
+            pass
+        return None
+
+    # Run fzf
+    try:
+        fzf_input = "\n".join(options_list).encode('utf-8')
+        result = subprocess.run(
+            ['fzf', '--height=40%', '--layout=reverse', '--header', prompt],
+            input=fzf_input,
+            stdout=subprocess.PIPE,
+            stderr=None
+        )
+        selected = result.stdout.decode('utf-8').strip()
+        return selected if selected else None
+    except Exception as e:
+        print(f"{R}[!] Error running fzf: {e}{END}")
+        return None
+
+def detect_hash_type(target):
+    """
+    Uses 'hashid' to detect hash type.
+    """
+    if not check_dependency("hashid"):
+        print(f"{Y}[!] 'hashid' tool not installed. Skipping auto-detect.{END}")
+        return None
+
+    print(f"{Y}[*] Analyzing hash format...{END}")
+    try:
+        # Check if target is a file or string
+        cmd = ['hashid', '-m', target]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+        output = result.stdout.strip()
+        
+        if not output:
+            print(f"{R}[!] hashid could not identify the hash.{END}")
+            return None
+
+        # Parse hashid output to get mode numbers
+        # Example output: "[+] MD5 [Hashcat Mode: 0]"
+        suggestions = []
+        for line in output.split('\n'):
+            if "[Hashcat Mode:" in line:
+                suggestions.append(line.strip())
+        
+        return suggestions
+    except Exception:
+        return None
+
+def get_all_hashcat_modes():
+    """
+    Parses 'hashcat --example-hashes' to get a full list of modes.
+    Returns a list of strings: "ModeID | Name"
+    """
+    modes = []
+    # Add common modes first for quick access
+    for code, name in COMMON_MODES.items():
+        modes.append(f"{code} | {name} (Common)")
+    
+    # Try to fetch full list
+    if check_dependency("hashcat"):
+        try:
+            res = subprocess.run(["hashcat", "--example-hashes"], stdout=subprocess.PIPE, text=True)
+            for line in res.stdout.split('\n'):
+                # Format: "MODE_NO  NAME" -> we need to parse roughly
+                # This is tricky as format changes. 
+                # Alternative: Use the common dict + manual entry if needed.
+                pass 
+        except:
+            pass
+            
+    return modes
+
+def step_1_select_mode(target):
+    print(f"\n{G}[Step 1] Hash Mode Selection{END}")
+    
+    # Attempt Auto-Detect
+    detected = detect_hash_type(target)
+    
+    mode_id = None
+    
+    if detected:
+        print(f"{Y}Auto-detect found the following:{END}")
+        # Add a "None of these" option
+        options = detected + ["Manual Search (fzf)"]
+        selection = run_fzf_selection(options, "Select detected type:")
+        
+        if selection and "Manual Search" not in selection:
+            # Extract ID from string like "[+] MD5 [Hashcat Mode: 0]"
+            import re
+            match = re.search(r"Mode: (\d+)", selection)
+            if match:
+                mode_id = match.group(1)
+                return mode_id
+
+    # Manual Selection
+    print(f"{Y}[*] Entering manual search mode...{END}")
+    
+    # Prepare list for fzf
+    mode_list = [f"{k} | {v}" for k, v in COMMON_MODES.items()]
+    mode_list.append("OTHER | Enter Custom Mode ID manually")
+    
+    selection = run_fzf_selection(mode_list, "Search Hash Mode (Type to filter):")
+    
+    if selection:
+        if "OTHER" in selection:
+            mode_id = input(f"{Y}Enter Hashcat Mode ID: {END}")
+        else:
+            mode_id = selection.split(" | ")[0]
+            
+    return mode_id
+
+def step_2_attack_mode():
+    print(f"\n{G}[Step 2] Attack Mode (-a){END}")
+    options = [
+        "0 | Dictionary (Straight) - Best for wordlists",
+        "3 | Brute-Force / Mask - Try all chars",
+        "1 | Combinator - Combine two wordlists",
+        "6 | Hybrid Wordlist + Mask",
+        "7 | Hybrid Mask + Wordlist"
+    ]
+    selection = run_fzf_selection(options, "Select Attack Mode:")
+    if selection:
+        return selection.split(" | ")[0]
+    return "0" # Default
+
+def step_3_wordlist(attack_mode):
+    if attack_mode == "3": 
+        # If Brute Force, we need a Mask, not a wordlist
+        mask = input(f"{Y}Enter Mask (e.g., ?a?a?a?a or ?d?d?d?d): {END}")
+        return mask, False # False indicates it's not a file path
+
+    print(f"\n{G}[Step 3] Wordlist Selection{END}")
+    
+    use_default = input(f"Use default ({DEFAULT_WORDLIST})? [Y/n]: ").strip().lower()
+    
+    if use_default in ['', 'y', 'yes']:
+        if os.path.exists(DEFAULT_WORDLIST):
+            return DEFAULT_WORDLIST, True
+        else:
+            print(f"{R}[!] Default wordlist not found at {DEFAULT_WORDLIST}{END}")
+    
+    # Custom path
+    while True:
+        path = input(f"{Y}Enter path to wordlist: {END}").strip()
+        # Remove quotes if user dragged and dropped file
+        path = path.replace("'", "").replace('"', "")
+        if os.path.exists(path):
+            return path, True
+        print(f"{R}[!] File not found. Try again.{END}")
+
+def step_4_rules(attack_mode):
+    if attack_mode != "0":
+        return None # Rules mostly apply to mode 0
+        
+    print(f"\n{G}[Step 4] Mutator Rules (-r){END}")
+    want_rules = input("Enable rules (best64, etc)? [y/N]: ").strip().lower()
+    
+    if want_rules == 'y':
+        if os.path.exists(HASHCAT_RULES_DIR):
+            rules = [f for f in os.listdir(HASHCAT_RULES_DIR) if f.endswith('.rule')]
+            if rules:
+                choice = run_fzf_selection(rules, "Select Rule File:")
+                if choice:
+                    return os.path.join(HASHCAT_RULES_DIR, choice)
+        
+        # Fallback if directory not found or empty
+        print(f"{R}[!] Could not list rules directory.{END}")
+        custom_rule = input(f"{Y}Enter path to rule file: {END}").strip()
+        return custom_rule if custom_rule else None
+        
+    return None
+
+def step_5_workload():
+    print(f"\n{G}[Step 5] Workload Profile (-w){END}")
+    options = [
+        "2 | Default (Balanced)",
+        "3 | High (Desktop/Gaming GPU) - Responsive",
+        "4 | Nightmare (Dedicated Rig) - Unresponsive",
+        "1 | Low (Laptop/Background)"
+    ]
+    selection = run_fzf_selection(options, "Select Workload:")
+    if selection:
+        return selection.split(" | ")[0]
+    return "2"
+
+def main():
+    print_header()
+    
+    if len(sys.argv) < 2:
+        print(f"{R}Usage: python3 lazycat.py <hash_string_or_file>{END}")
+        sys.exit(1)
+        
+    target = sys.argv[1]
+    
+    # 1. Mode
+    mode = step_1_select_mode(target)
+    if not mode:
+        print(f"{R}[!] No mode selected. Exiting.{END}")
+        sys.exit(1)
+
+    # 2. Attack Mode
+    attack = step_2_attack_mode()
+
+    # 3. Wordlist / Mask
+    payload, is_file = step_3_wordlist(attack)
+
+    # 4. Rules
+    rule_path = step_4_rules(attack)
+
+    # 5. Workload
+    workload = step_5_workload()
+    
+    # --- BUILD COMMANDS ---
+    
+    # Base command
+    cmd_args = ["hashcat", "-m", mode, "-a", attack, "-w", workload]
+    
+    # Target
+    cmd_args.append(target)
+    
+    # Payload
+    cmd_args.append(payload)
+    
+    # Rules
+    if rule_path:
+        cmd_args.extend(["-r", rule_path])
+
+    # Construct Strings
+    local_cmd_str = " ".join(cmd_args)
+    
+    # Portable String
+    portable_args = cmd_args.copy()
+    # Replace absolute paths with placeholders for portable view
+    if is_file and "/" in payload:
+        portable_args[portable_args.index(payload)] = "<WORDLIST>"
+    if rule_path and "/" in rule_path:
+        idx = portable_args.index(rule_path)
+        portable_args[idx] = "<RULE_FILE>"
+    if "/" in target:
+         portable_args[portable_args.index(target)] = "hash.txt"
+         
+    portable_cmd_str = " ".join(portable_args)
+
+    # --- OUTPUT ---
+    print(f"\n{B}----------------------------------------{END}")
+    print(f"{G} [LOCAL COMMAND] {END}")
+    print(f"{local_cmd_str}")
+    print(f"\n{Y} [PORTABLE BLUEPRINT] {END}")
+    print(f"{portable_cmd_str}")
+    print(f"{B}----------------------------------------{END}")
+
+    # --- EXECUTE ---
+    run_now = input(f"\n{R}Execute command now? [y/N]: {END}").strip().lower()
+    if run_now == 'y':
+        print(f"\n{G}[*] Launching Hashcat...{END}\n")
+        try:
+            subprocess.run(cmd_args)
+        except KeyboardInterrupt:
+            print(f"\n{R}[!] Aborted.{END}")
+
+if __name__ == "__main__":
+    main()
